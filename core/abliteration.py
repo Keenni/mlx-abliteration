@@ -554,6 +554,869 @@ def get_ablated_parameters(model: nn.Module, refusal_vector: Any, target_modules
 
     return tree_unflatten(new_flat_params)
 
+"""Core components for the MLX Abliteration Toolkit.
+
+This module provides the core functionality for the abliteration process,
+including model wrapping for activation probing, refusal direction calculation,
+and weight modification.
+
+Dependencies:
+- mlx
+- mlx-lm
+- safetensors
+"""
+import json
+import logging
+import shutil
+from pathlib import Path
+from typing import List, Dict, Tuple, Optional, Any, Callable, Iterable
+
+import mlx.core as mx
+import mlx.nn as nn
+from mlx_lm.utils import tree_flatten
+from mlx.utils import tree_unflatten
+from safetensors import safe_open
+
+from .utils import get_module_from_key, find_probe_indices
+from mlx.nn.layers.quantized import QuantizedLinear
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_TARGET_MODULES = [
+    "self_attn.o_proj",
+    "self_attn.q_proj",
+    "self_attn.k_proj",
+    "self_attn.v_proj",
+    "mlp.down_proj",
+    "mlp.c_proj",
+    "mlp.up_proj",
+    "mlp.switch_mlp.down_proj",
+    "mlp.switch_mlp.up_proj",
+]
+
+
+class ActivationProbeWrapper(nn.Module):
+    """A wrapper around an MLX model to probe and capture activations.
+
+    This class wraps an existing MLX model (or its base model) to provide a
+    forward pass that captures the hidden states from specified layers.
+
+    Attributes:
+        embedding (nn.Module): The model's token embedding layer.
+        model_layers (List[nn.Module]): The list of transformer layers.
+        norm (nn.Module): The final normalization layer.
+        lm_head (nn.Module, optional): The language model head.
+    """
+    def __init__(self, model: nn.Module):
+        """Initializes the ActivationProbeWrapper.
+
+        Args:
+            model (nn.Module): The MLX model to wrap.
+
+        Raises:
+            AttributeError: If the model does not have the expected structure
+                (e.g., missing 'layers', 'embed_tokens', or 'norm').
+        """
+        super().__init__()
+        
+        # Attempt to find the base model or container with layers
+        self.base_model = None
+        
+        # Prefer the inner model if it has both layers and embeddings
+        if hasattr(model, "model") and hasattr(model.model, "layers") and (hasattr(model.model, "embed_tokens") or hasattr(model.model, "wte")):
+            self.base_model = model.model
+        # Otherwise check the top level model
+        elif hasattr(model, "layers") and (hasattr(model, "embed_tokens") or hasattr(model, "wte")):
+            self.base_model = model
+        # Fallback: just look for layers
+        elif hasattr(model, "layers"):
+            self.base_model = model
+        elif hasattr(model, "model") and hasattr(model.model, "layers"):
+            self.base_model = model.model
+        
+        # If not found, try to be more exhaustive or provide better error
+        if self.base_model is None:
+             available_attrs = list(model.__dict__.keys())
+             if hasattr(model, "model"):
+                 available_attrs.extend([f"model.{k}" for k in model.model.__dict__.keys()])
+             
+             raise AttributeError(
+                 f"The provided model does not have the expected structure. "
+                 f"Could not find '.layers' or '.model.layers'. "
+                 f"Available attributes: {available_attrs}"
+             )
+
+        # Now look for components in base_model
+        if hasattr(self.base_model, "embed_tokens"):
+            self.embedding = self.base_model.embed_tokens
+        elif hasattr(self.base_model, "wte"): # Common in some other archs
+            self.embedding = self.base_model.wte
+        else:
+             raise AttributeError("Could not find embedding layer (expected 'embed_tokens' or 'wte').")
+
+        self.model_layers = self.base_model.layers
+        
+        if hasattr(self.base_model, "norm"):
+            self.norm = self.base_model.norm
+        elif hasattr(self.base_model, "ln_f"): # GPT-2 style
+            self.norm = self.base_model.ln_f
+        else:
+             raise AttributeError("Could not find normalization layer (expected 'norm' or 'ln_f').")
+
+        self.lm_head = getattr(model, "lm_head", getattr(self.base_model, "lm_head", None))
+
+        if self.lm_head is None:
+            logger.warning("Could not find 'lm_head'. Probing will proceed without returning logits.", extra={"extra_info": {"event": "missing_lm_head"}})
+
+    def __call__(
+        self,
+        inputs: mx.array,
+        mask: Optional[mx.array],
+        layers_to_probe: Optional[List[int]] = None,
+    ) -> Tuple[Optional[mx.array], Dict[int, mx.array]]:
+        """Performs a forward pass and captures activations.
+
+        Args:
+            inputs (mx.array): The input token IDs.
+            mask (Optional[mx.array]): The attention mask.
+            layers_to_probe (Optional[List[int]]): A list of layer indices from which
+                to capture activations. If None, no activations are captured.
+
+        Returns:
+            A tuple containing:
+            - The model's logits (if lm_head is present).
+            - A dictionary mapping layer indices to their captured activations.
+        """
+        captured_activations = {}
+        h = self.embedding(inputs)
+
+        # Some model layer implementations expect a cache-like object (either
+        # indexable or providing methods like `update_and_fetch` and an
+        # `offset` attribute). Passing None sometimes triggers UnboundLocalError
+        # inside those implementations, and passing a plain dict can raise
+        # KeyError when numeric indices are accessed. Create a lightweight
+        # DummyCache that is safe for all layers and share it across the
+        # forward pass.
+        class DummyCache:
+            def __init__(self):
+                # offset is used by rotary/rope implementations
+                self.offset = 0
+                # provide slot-keys used by gated-delta implementations
+                self._store = {0: None, 1: None}
+
+            def __getitem__(self, idx):
+                return self._store.get(idx, None)
+
+            def __setitem__(self, idx, val):
+                self._store[idx] = val
+
+            def update_and_fetch(self, keys, values):
+                # Some attention implementations expect the cache to return
+                # possibly updated (keys, values). For probing we don't need
+                # to modify them, so return as-is.
+                return keys, values
+
+        cache = DummyCache()
+
+        for i, layer in enumerate(self.model_layers):
+            # Create a fresh cache for each layer to avoid state leakage between layers
+            # (crucial for Mamba/Linear Attention models that store state in cache[0])
+            layer_cache = DummyCache()
+            output = layer(h, mask=mask, cache=layer_cache)
+            h = output[0] if isinstance(output, tuple) else output
+            if layers_to_probe is not None and i in layers_to_probe:
+                captured_activations[i] = h
+
+        h = self.norm(h)
+        logits = self.lm_head(h) if self.lm_head is not None else None
+        return logits, captured_activations
+
+
+def calculate_refusal_direction(mean_harmful_activations: mx.array, mean_harmless_activations: mx.array, method: str = "difference") -> mx.array:
+    """Calculates the refusal direction vector.
+
+    The refusal direction can be calculated using two methods:
+    - 'difference': Simple difference (harmful_mean - harmless_mean)
+    - 'projected': Difference with harmless component projected out
+      (refusal_dir - projection of refusal_dir onto normalized harmless_mean)
+
+    Args:
+        mean_harmful_activations (mx.array): The mean activation vector for harmful prompts.
+        mean_harmless_activations (mx.array): The mean activation vector for harmless prompts.
+        method (str): Method to calculate refusal direction. Either 'difference' or 'projected'.
+            Defaults to 'difference'.
+
+    Returns:
+        mx.array: The calculated refusal direction vector.
+
+    Raises:
+        ValueError: If either of the input activation vectors is None or if method is invalid.
+    """
+    if mean_harmful_activations is None or mean_harmless_activations is None:
+        raise ValueError("Mean activation vectors cannot be None.")
+    
+    if method not in ["difference", "projected"]:
+        raise ValueError(f"Invalid method '{method}'. Must be 'difference' or 'projected'.")
+    
+    # Calculate the base refusal direction
+    refusal_dir = mean_harmful_activations - mean_harmless_activations
+    
+    if method == "projected":
+        # Normalize the harmless mean
+        harmless_norm = mx.linalg.norm(mean_harmless_activations)
+        if harmless_norm > 1e-9:
+            harmless_normalized = mean_harmless_activations / harmless_norm
+            # Project refusal_dir onto harmless_normalized
+            projection_scalar = mx.sum(refusal_dir * harmless_normalized)
+            # Subtract the projection to get refined refusal direction
+            refusal_dir = refusal_dir - projection_scalar * harmless_normalized
+            logger.info(f"Applied projected method: projection_scalar={projection_scalar.item():.4f}", 
+                       extra={"extra_info": {"event": "projected_refusal_calculation", "actual_output": {"projection_scalar": float(projection_scalar.item())}}})
+        else:
+            logger.warning("Harmless mean norm too small for projection, falling back to difference method")
+    
+    norm = mx.linalg.norm(refusal_dir).item()
+    logger.info(f"Calculated refusal direction vector (method={method}) with norm {norm:.4f}", 
+               extra={"extra_info": {"event": "refusal_direction_calculated", "actual_output": {"norm": norm, "method": method}}})
+    return refusal_dir
+
+
+def get_ablated_parameters(model: nn.Module, refusal_vector: Any, target_modules: Optional[List[str]] = None, ablation_strength: Any = 1.0, ablation_method: str = "projection") -> Dict:
+    """
+    Orthogonalizes the weights of target modules with respect to the refusal vector.
+
+    This function iterates through the model's parameters and modifies the weights
+    of specified modules to be orthogonal to the refusal vector, effectively
+    "ablating" the corresponding behavior.
+
+            w_ablated_float = w_float - ablation_strength * proj_W_on_v
+        model (nn.Module): The model to modify.
+        refusal_vector (mx.array | Dict[int, mx.array]): The refusal direction vector(s).
+            Can be a single mx.array (applied to all layers) or a dictionary mapping
+            layer indices to specific refusal vectors.
+        target_modules (Optional[List[str]]): A list of module names to target for
+            ablation. Defaults to `["self_attn.o_proj", "mlp.down_proj", "mlp.c_proj"]`.
+
+    Args:
+        ablation_strength (float | Dict[int, float]): The strength of the ablation.
+            Can be a single float (applied to all layers) or a dictionary mapping
+            layer indices to specific strengths. Defaults to 1.0.
+        ablation_method (str): Either 'sequential' to subtract projections for each component
+            sequentially (legacy behavior), or 'projection' to build a projection matrix
+            P = sum_i v_i v_i^T and remove P @ W in one step. Defaults to 'projection'.
+
+    Returns:
+        Dict: A dictionary of the updated model parameters.
+    """
+    if target_modules is None:
+        # Include common naming variants used across model families (e.g.,
+        # 'switch_mlp.down_proj' or 'mlp.up_proj') so default ablation
+        # targets match more models out of the box.
+        target_modules = DEFAULT_TARGET_MODULES
+
+    # Helper to prepare projection data for a given vector
+    def prepare_projection_data(rv):
+        if rv.ndim == 1:
+            rv = rv[None, :]
+        
+        v_norms = []
+        for i in range(rv.shape[0]):
+            v = rv[i]
+            v_norm = v / mx.maximum(mx.linalg.norm(v), 1e-9)
+            v_norms.append(v_norm)
+            
+        v_projs = [v[None, :].T for v in v_norms]
+        v_norm_Ts = [v[None, :] for v in v_norms]
+        
+        P = None
+        if ablation_method == "projection":
+            try:
+                P = sum((v[:, None] @ v[None, :]) for v in v_norms)
+            except Exception:
+                P = None
+        return P, v_projs, v_norm_Ts, v_norms
+
+    # Cache for projection data: key is layer_idx (or -1 for global)
+    # value is (P, v_projs, v_norm_Ts, v_norms)
+    proj_cache = {}
+
+    # Pre-calculate global projection if refusal_vector is not a dict
+    if not isinstance(refusal_vector, dict):
+        proj_cache[-1] = prepare_projection_data(refusal_vector)
+
+    flat_params = tree_flatten(model.parameters())
+    params_dict = dict(flat_params)
+    processed_keys = set()
+    new_flat_params = []
+    modified_count = 0
+
+    for key, W in flat_params:
+        if key in processed_keys:
+            continue
+
+        is_target = any(target in key for target in target_modules) and "weight" in key
+        if not is_target:
+            new_flat_params.append((key, W))
+            continue
+
+        # Extract layer index from key
+        # Expected formats: "model.layers.X...", "layers.X..."
+        parts = key.split('.')
+        layer_idx = -1
+        try:
+            if parts[0] == "model" and parts[1] == "layers" and parts[2].isdigit():
+                layer_idx = int(parts[2])
+            elif parts[0] == "layers" and parts[1].isdigit():
+                layer_idx = int(parts[1])
+        except (IndexError, ValueError):
+            pass
+
+        # Determine refusal vector and strength for this layer
+        current_strength = ablation_strength
+        if isinstance(ablation_strength, dict):
+            current_strength = ablation_strength.get(layer_idx, 0.0)
+            
+        # Skip if strength is effectively zero
+        if abs(current_strength) < 1e-6:
+            new_flat_params.append((key, W))
+            continue
+
+        # Get projection data
+        if isinstance(refusal_vector, dict):
+            rv = refusal_vector.get(layer_idx)
+            if rv is None:
+                # No vector for this layer, skip
+                new_flat_params.append((key, W))
+                continue
+            
+            if layer_idx not in proj_cache:
+                proj_cache[layer_idx] = prepare_projection_data(rv)
+            P, v_projs, v_norm_Ts, v_norms = proj_cache[layer_idx]
+        else:
+            P, v_projs, v_norm_Ts, v_norms = proj_cache[-1]
+
+        try:
+            module = get_module_from_key(model, key)
+        except (AttributeError, KeyError):
+            logger.warning(f"Could not find module for key: {key}. Skipping ablation.", extra={"extra_info": {"event": "module_not_found", "inputs": {"key": key}}})
+            new_flat_params.append((key, W))
+            continue
+
+    # Handle quantized linear layers separately
+        if isinstance(module, QuantizedLinear):
+            module_key = ".".join(key.split('.')[:-1])
+            scales_key, biases_key = f"{module_key}.scales", f"{module_key}.biases"
+            scales, biases = params_dict.get(scales_key), params_dict.get(biases_key)
+
+            if scales is None:
+                logger.warning(f"Could not find scales for quantized weight: {key}. Skipping.", extra={"extra_info": {"event": "scales_not_found", "inputs": {"key": key}}})
+                new_flat_params.append((key, W))
+                continue
+
+            # Dequantize, ablate, and then re-quantize
+            try:
+                w_float = mx.dequantize(W, scales, biases, module.group_size, module.bits)
+            except Exception as e:
+                # Fallback for formats like mxfp4 where dequantize might fail due to types/biases
+                logger.warning(f"mx.dequantize failed for {key}: {e}. Attempting fallback via forward pass.", extra={"extra_info": {"event": "dequantize_fallback", "inputs": {"key": key}}})
+                try:
+                    # Infer input_dim from scales
+                    # scales shape is (out, in/group)
+                    out_dim = scales.shape[0]
+                    in_dim = scales.shape[1] * module.group_size
+                    
+                    # Create identity matrix (input_dim x input_dim)
+                    # Use float16 to save memory/time
+                    I = mx.eye(in_dim, dtype=mx.float16)
+                    
+                    # Forward pass: y = x @ W.T
+                    # I @ W.T = W.T
+                    # Note: module(I) uses the layer's forward pass which handles specific quantization modes
+                    w_T = module(I)
+                    
+                    # If the layer has an additive bias, subtract it
+                    if hasattr(module, "bias") and module.bias is not None:
+                        w_T = w_T - module.bias
+                        
+                    w_float = w_T.T
+                except Exception as e2:
+                    logger.error(f"Fallback dequantization failed for {key}: {e2}", extra={"extra_info": {"event": "dequantize_failed", "inputs": {"key": key}}})
+                    new_flat_params.append((key, W))
+                    continue
+
+            # w_float may have shape (H, out) or (out, H) depending on layer layout.
+            # Ensure we project along the hidden dimension (H) by transposing if needed.
+            try:
+                H = v_norms[0].shape[0]
+            except Exception:
+                H = None
+
+            transposed = False
+            if w_float.ndim == 2 and H is not None:
+                r, c = w_float.shape
+                if r == H:
+                    w_mat = w_float
+                elif c == H:
+                    w_mat = w_float.T
+                    transposed = True
+                else:
+                    # unexpected shape: fall back to original logic
+                    w_mat = w_float
+            else:
+                w_mat = w_float
+
+            if ablation_method == "projection" and P is not None:
+                # apply projection removal in one step: subtract sum_i v_i (v_i^T @ W)
+                proj = None
+                for v in v_norms:
+                    comp = v[:, None] @ (v[None, :] @ w_mat)
+                    if proj is None:
+                        proj = comp
+                    else:
+                        proj = proj + comp
+                if proj is None:
+                    proj = mx.zeros_like(w_mat)
+                w_ablated_mat = w_mat - current_strength * proj
+            else:
+                # Sequentially remove projections onto each component
+                w_ablated_mat = w_mat
+                for v_proj_i, v_norm_T_i in zip(v_projs, v_norm_Ts):
+                    proj_W_on_v = v_proj_i @ (v_norm_T_i @ w_ablated_mat)
+                    w_ablated_mat = w_ablated_mat - current_strength * proj_W_on_v
+
+            # If we transposed earlier, transpose back
+            if transposed:
+                w_ablated_float = w_ablated_mat.T
+            else:
+                w_ablated_float = w_ablated_mat
+
+            # Verification check: compute max residual projection norm across components
+            try:
+                norms = [float(mx.linalg.norm(v_norm_T_i @ w_ablated_float).item()) for v_norm_T_i in v_norm_Ts]
+                check_norm = max(norms) if norms else 0.0
+            except Exception:
+                check_norm = None
+            logger.info(f"Orthogonalization check for {key}: norm is {check_norm}", extra={"extra_info": {"event": "ortho_check", "inputs": {"key": key}, "actual_output": {"norm": check_norm}}})
+
+            new_w, new_scales, new_biases = mx.quantize(w_ablated_float, module.group_size, module.bits)
+
+            new_flat_params.extend([(key, new_w), (scales_key, new_scales)])
+            if new_biases is not None and biases is not None:
+                new_flat_params.append((biases_key, new_biases))
+            processed_keys.update([key, scales_key, biases_key])
+            modified_count += 1
+
+        # Handle standard linear layers
+        elif W.ndim == 2:
+            # Check if it's a floating point type to avoid processing packed weights (e.g. BitLinear)
+            # that don't inherit from QuantizedLinear but have 2D weight tensors.
+            if not (W.dtype == mx.float32 or W.dtype == mx.float16 or W.dtype == mx.bfloat16):
+                logger.warning(f"Skipping ablation for non-floating point weight {key} with dtype {W.dtype}", extra={"extra_info": {"event": "skip_non_float", "inputs": {"key": key, "dtype": str(W.dtype)}}})
+                new_flat_params.append((key, W))
+                continue
+
+            # Project the weight matrix onto the refusal vector
+            # Some weight matrices have shape (H, out) while others are (out, H).
+            # We want to project along the hidden dimension H (length of refusal_vector).
+            try:
+                H = v_norms[0].shape[0]
+            except Exception:
+                H = None
+
+            transposed = False
+            if H is not None:
+                r, c = W.shape
+                if r == H:
+                    W_mat = W
+                elif c == H:
+                    W_mat = W.T
+                    transposed = True
+                else:
+                    # Shapes don't match expected hidden dim; skip ablation for this tensor
+                    new_flat_params.append((key, W))
+                    continue
+            else:
+                W_mat = W
+
+            if ablation_method == "projection" and P is not None:
+                proj = None
+                for v in v_norms:
+                    comp = v[:, None] @ (v[None, :] @ W_mat)
+                    if proj is None:
+                        proj = comp
+                    else:
+                        proj = proj + comp
+                if proj is None:
+                    proj = mx.zeros_like(W_mat)
+                W_ablated_mat = W_mat - current_strength * proj
+            else:
+                W_ablated_mat = W_mat
+                for v_proj_i, v_norm_T_i in zip(v_projs, v_norm_Ts):
+                    proj_W_on_v = v_proj_i @ (v_norm_T_i @ W_ablated_mat)
+                    W_ablated_mat = W_ablated_mat - current_strength * proj_W_on_v
+
+            # transpose back if needed
+            if transposed:
+                W_ablated = W_ablated_mat.T
+            else:
+                W_ablated = W_ablated_mat
+
+            # Verification check: compute max residual projection norm across components
+            try:
+                norms = [float(mx.linalg.norm(v_norm_T_i @ W_ablated).item()) for v_norm_T_i in v_norm_Ts]
+                check_norm = max(norms) if norms else 0.0
+            except Exception:
+                check_norm = None
+            logger.info(f"Orthogonalization check for {key}: norm is {check_norm}", extra={"extra_info": {"event": "ortho_check", "inputs": {"key": key}, "actual_output": {"norm": check_norm}}})
+
+            new_flat_params.append((key, W_ablated))
+            modified_count += 1
+
+        else:
+            new_flat_params.append((key, W))
+
+    if modified_count > 0:
+        logger.info(f"Orthogonalized {modified_count} weight matrices.", extra={"extra_info": {"event": "weights_orthogonalized", "actual_output": {"modified_count": modified_count}}})
+
+        # Emit per-tensor max-abs-diff diagnostics so callers (and logs) can
+        # verify that ablation produced non-zero changes for each modified
+        # parameter. This is useful when the later `model.update(...)`/save
+        # path may not persist changes for unexpected reasons.
+        try:
+            for k, new_v in new_flat_params:
+                # Only report for keys that existed in the original params dict
+                orig_v = params_dict.get(k)
+                if orig_v is None:
+                    continue
+                try:
+                    # compute max abs diff using mlx.linalg if available
+                    diff = mx.array(orig_v) - mx.array(new_v)
+                    max_abs = float(mx.linalg.norm(diff).item())
+                except Exception:
+                    # fall back to a conservative numeric estimate
+                    try:
+                        import numpy as _np
+
+                        o = _np.array(orig_v)
+                        n = _np.array(new_v)
+                        max_abs = float(_np.linalg.norm(o - n))
+                    except Exception:
+                        max_abs = None
+
+                logger.info(f"Post-ablation tensor diff for {k}: {max_abs}", extra={"extra_info": {"event": "post_ablation_diff", "inputs": {"key": k}, "actual_output": {"max_abs_diff": max_abs}}})
+        except Exception:
+            # Never fail the ablation because of logging instrumentation
+            logger.debug("Failed to emit per-tensor post-ablation diffs", exc_info=True)
+
+    return tree_unflatten(new_flat_params)
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SSD-Offload Ablation (shard-wise, low-memory)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_layer_idx(key: str) -> int:
+    """Extract layer index from a parameter key like 'model.layers.23.mlp.down_proj.weight'."""
+    parts = key.split('.')
+    for i, p in enumerate(parts):
+        if p == 'layers' and i + 1 < len(parts) and parts[i + 1].isdigit():
+            return int(parts[i + 1])
+    return -1
+
+
+def _get_proj_data_for_rv(rv: mx.array, strength: float, ablation_method: str):
+    """Pre-compute projection matrices for a refusal vector."""
+    if rv is None:
+        return None
+    if rv.ndim == 1:
+        rv = rv[None, :]
+    v_norms = []
+    for i in range(rv.shape[0]):
+        v = rv[i]
+        v_norm = v / mx.maximum(mx.linalg.norm(v), 1e-9)
+        v_norms.append(v_norm)
+    v_projs = [v[None, :].T for v in v_norms]
+    v_norm_Ts = [v[None, :] for v in v_norms]
+    P = None
+    if ablation_method == "projection":
+        try:
+            P = sum(v[:, None] @ v[None, :] for v in v_norms)
+        except Exception:
+            P = None
+    return v_norms, v_projs, v_norm_Ts, P, strength
+
+
+def _ablate_single_tensor(
+    W: mx.array,
+    v_norms: list,
+    v_projs: list,
+    v_norm_Ts: list,
+    P,  # noqa: N803
+    strength: float,
+    ablation_method: str,
+) -> mx.array:
+    """Apply projection ablation to a single weight matrix."""
+    H = v_norms[0].shape[0]
+    transposed = False
+
+    if W.ndim == 2:
+        r, c = W.shape
+        if r == H:
+            W_mat = W
+        elif c == H:
+            W_mat = W.T
+            transposed = True
+        else:
+            W_mat = W
+    else:
+        W_mat = W
+
+    if ablation_method == "projection" and P is not None:
+        proj = None
+        for v in v_norms:
+            comp = v[:, None] @ (v[None, :] @ W_mat)
+            if proj is None:
+                proj = comp
+            else:
+                proj = proj + comp
+        if proj is None:
+            proj = mx.zeros_like(W_mat)
+        W_ablated_mat = W_mat - strength * proj
+    else:
+        W_ablated_mat = W_mat
+        for v_proj_i, v_norm_T_i in zip(v_projs, v_norm_Ts):
+            proj_W_on_v = v_proj_i @ (v_norm_T_i @ W_ablated_mat)
+            W_ablated_mat = W_ablated_mat - strength * proj_W_on_v
+
+    if transposed:
+        return W_ablated_mat.T
+    return W_ablated_mat
+
+
+def shard_wise_ablated_parameters(
+    source_model_path: str,
+    refusal_vector: Any,
+    target_modules: Optional[List[str]] = None,
+    ablation_strength: Any = 1.0,
+    ablation_method: str = "projection",
+) -> Dict[str, Dict[str, mx.array]]:
+    """
+    Compute ablated weights shard-by-shard with minimal peak memory.
+
+    For each shard file this function:
+      1. Loads only that shard's tensors from disk
+      2. Applies refusal-vector projection to target weights
+      3. Returns the modified tensors
+
+    Peak memory ≈ size of one shard (~15 GB for 122B/16-shard BF16) instead of
+    the full model (~244 GB), enabling ablation on machines with limited RAM.
+
+    Works with BF16/FP16 models. For quantized models use standard mode.
+
+    Args:
+        source_model_path: Directory containing the sharded model
+        refusal_vector: Per-layer Dict[int, mx.array] or global mx.array
+        target_modules: Module name patterns to target (default: DEFAULT_TARGET_MODULES)
+        ablation_strength: Scalar float or Dict[int, float] per layer
+        ablation_method: 'projection' (default) or 'sequential'
+
+    Returns:
+        Dict[shard_filename, Dict[tensor_name, mx.array]]
+    """
+    if target_modules is None:
+        target_modules = DEFAULT_TARGET_MODULES
+
+    source_path = Path(source_model_path)
+    index_path = source_path / "model.safetensors.index.json"
+    if not index_path.is_file():
+        raise ValueError(
+            f"shard_wise_ablated_parameters requires a sharded model with "
+            f"'model.safetensors.index.json' at {source_model_path}"
+        )
+
+    with open(index_path) as f:
+        index_data = json.load(f)
+    weight_map = index_data.get("weight_map", {})
+
+    # Group tensor names by shard filename
+    shard_tensors: Dict[str, List[str]] = {}
+    for tensor_name, shard_name in weight_map.items():
+        shard_tensors.setdefault(shard_name, []).append(tensor_name)
+
+    def get_layer_rv_and_strength(layer_idx: int):
+        if isinstance(refusal_vector, dict):
+            rv = refusal_vector.get(layer_idx)
+            if rv is None and -1 in refusal_vector:
+                rv = refusal_vector[-1]
+            s = (
+                ablation_strength.get(layer_idx)
+                if isinstance(ablation_strength, dict)
+                else ablation_strength
+            )
+        else:
+            rv, s = refusal_vector, ablation_strength
+        return rv, s
+
+    # Cache projection data per layer to avoid recomputing
+    proj_cache: Dict[int, Any] = {}
+
+    def get_proj(layer_idx: int, rv: mx.array, strength: float):
+        if layer_idx in proj_cache:
+            return proj_cache[layer_idx]
+        data = _get_proj_data_for_rv(rv, strength, ablation_method)
+        proj_cache[layer_idx] = data
+        return data
+
+    results: Dict[str, Dict[str, mx.array]] = {}
+
+    for shard_name, tensor_names in shard_tensors.items():
+        shard_path = source_path / shard_name
+        logger.info(
+            f"[SSD-offload] Loading shard {shard_name} "
+            f"({len(tensor_names)} tensors)",
+            extra={"extra_info": {"event": "ssd_shard_load", "shard": shard_name}},
+        )
+
+        # Load only this shard
+        shard_weights: Dict[str, mx.array] = {}
+        with safe_open(shard_path, framework="mlx") as f:
+            for name in tensor_names:
+                shard_weights[name] = f.get_tensor(name)
+
+        ablated_shard: Dict[str, mx.array] = {}
+        modified = 0
+
+        for name, W in shard_weights.items():
+            # Skip non-target tensors
+            if not any(t in name for t in target_modules) or "weight" not in name:
+                ablated_shard[name] = W
+                continue
+
+            layer_idx = _extract_layer_idx(name)
+            rv, strength = get_layer_rv_and_strength(layer_idx)
+
+            if rv is None or abs(strength) < 1e-6:
+                ablated_shard[name] = W
+                continue
+
+            v_norms, v_projs, v_norm_Ts, P, strength = get_proj(layer_idx, rv, strength)  # noqa: N803
+
+            # Quantized weights: dequant → ablate → re-quantize
+            is_quant = (
+                hasattr(W, 'dtype')
+                and W.dtype in (mx.int4, mx.uint4, mx.int8, mx.uint8)
+            )
+            if is_quant:
+                # Fall back to standard mode for quantized models
+                logger.debug(
+                    f"Skipping quantized weight {name} in SSD-offload mode; "
+                    f"run standard mode for quantized models to fully ablate",
+                )
+                ablated_shard[name] = W
+                continue
+
+            ablated_tensor = _ablate_single_tensor(
+                W, v_norms, v_projs, v_norm_Ts, P, strength, ablation_method
+            )
+            ablated_shard[name] = ablated_tensor
+            modified += 1
+
+        results[shard_name] = ablated_shard
+        logger.info(
+            f"[SSD-offload] Ablated {modified}/{len(tensor_names)} tensors in {shard_name}",
+            extra={"extra_info": {"event": "ssd_shard_done", "shard": shard_name, "modified": modified}},
+        )
+
+        # Free this shard's weights before loading the next
+        del shard_weights
+
+    return results
+
+
+def shard_wise_save_ablated_model(
+    output_dir: str,
+    ablated_shards: Dict[str, Dict[str, mx.array]],
+    tokenizer: Any,
+    abliteration_log: Dict,
+    source_model_path: str,
+):
+    """
+    Save shard-wise ablated weights to output_dir, preserving original sharding.
+    Copies all non-weight files (config, tokenizer, ...) from source_model_path.
+    """
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    source_path = Path(source_model_path)
+
+    # Copy all non-safetensors files verbatim
+    for item in source_path.iterdir():
+        if (
+            item.name not in ablated_shards
+            and item.suffix != ".safetensors"
+            and item.name != "model.safetensors.index.json"
+        ):
+            if item.is_file():
+                shutil.copy2(item, output_path / item.name)
+
+    # Copy weight index (unchanged)
+    idx_src = source_path / "model.safetensors.index.json"
+    if idx_src.exists():
+        shutil.copy2(idx_src, output_path / "model.safetensors.index.json")
+
+    # Warn about extra tensors not in the original weight map
+    with open(idx_src) as f:
+        orig_weight_map = set(json.load(f).get("weight_map", {}).keys())
+    all_result_keys: set = set()
+    for shard_data in ablated_shards.values():
+        all_result_keys.update(shard_data.keys())
+    extra = all_result_keys - orig_weight_map
+    if extra:
+        logger.warning(
+            f"{len(extra)} tensor(s) in result not in original weight map and will be discarded: {extra}",
+            extra={"extra_info": {"event": "ssd_extra_tensors_discarded", "count": len(extra)}},
+        )
+
+    # Write each shard
+    for shard_name, tensors in ablated_shards.items():
+        src_shard_path = source_path / shard_name
+        metadata = {}
+        try:
+            with safe_open(src_shard_path, framework="mlx") as f:
+                raw = f.metadata()
+                if raw:
+                    metadata = {str(k): str(v) for k, v in raw.items()}
+        except Exception as e:
+            logger.debug(f"Could not read metadata from {shard_name}: {e}")
+
+        logger.info(
+            f"[SSD-offload] Saving {len(tensors)} tensors -> {shard_name}",
+            extra={"extra_info": {"event": "ssd_shard_save", "shard": shard_name, "count": len(tensors)}},
+        )
+        mx.save_safetensors(str(output_path / shard_name), tensors, metadata=metadata)
+
+    # Tokenizer
+    try:
+        tokenizer.save_pretrained(str(output_path))
+    except AttributeError:
+        (output_path / "tokenizer.json").write_text("{}")
+
+    # Abliteration log
+    with open(output_path / "abliteration_log.json", "w") as f:
+        json.dump(abliteration_log, f, indent=4)
+
+    # Directory listing for verification
+    files = []
+    for p in sorted(output_path.iterdir()):
+        try:
+            st = p.stat()
+            files.append({"name": p.name, "size": st.st_size})
+        except Exception:
+            files.append({"name": p.name, "size": None})
+    logger.info(
+        f"[SSD-offload] Saved to {output_path} -- {len(files)} files",
+        extra={"extra_info": {"event": "ssd_save_dir_listing", "file_count": len(files), "files": files}},
+    )
 
 def save_ablated_model(
     output_dir: str,

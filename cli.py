@@ -42,6 +42,8 @@ from core.abliteration import (
     get_ablated_parameters,
     save_ablated_model,
     get_mean_activations,
+    shard_wise_ablated_parameters,
+    shard_wise_save_ablated_model,
 )
 from core.logging_config import setup_structured_logging
 from core.utils import extract_eot_from_chat_template, tokenizer_marker_diff, find_probe_indices
@@ -87,6 +89,7 @@ def parse_args() -> argparse.Namespace:
     output_group.add_argument("--dump-dequant", action="store_true", help="Write dequantized .npy dumps for ablated tensors into the output directory (debug).")
     output_group.add_argument("--eval-after", action="store_true", help="Run a short post-ablation generation-based refusal evaluation (diagnostic).")
     output_group.add_argument("--eval-prompts", type=str, default=None, help="Path to a JSONL file with diagnostic prompts to run during --eval-after. If omitted, a small default set is used.")
+    output_group.add_argument("--ssd-offload", action="store_true", help="Enable SSD-offload mode for large models. Loads/refuses shards one-at-a-time to reduce peak RAM usage. Experimental.")
     return parser.parse_args()
 
 def parse_layers(layers_str: str, num_model_layers: int) -> List[int]:
@@ -581,13 +584,11 @@ def run_abliteration(args: argparse.Namespace):
         ablated_params = get_ablated_parameters(model, refusal_vector, ablation_strength=args.ablation_strength, ablation_method=args.ablate_method)
         model.update(ablated_params)
         mx.eval(model.parameters())
-        logging.info("Model parameters updated", extra={"extra_info": {"component": "cli", "event": "orthogonalization_end"}})
 
-    logging.info("Saving abliterated model", extra={"extra_info": {"component": "cli", "event": "saving_start"}})
-    
-    # Handle logging for per-layer policy where use_layer_idx might not be defined
+    logging.info("Model parameters updated", extra={"extra_info": {"component": "cli", "event": "orthogonalization_end"}})
+
+    # Build the abliteration log (shared by both code paths)
     log_layer_idx = use_layer_idx if args.refusal_vector_policy == "single" else "per-layer"
-    
     abliteration_log = {
         "source_model": args.model,
         "harmless_dataset": args.harmless_dataset,
@@ -605,8 +606,41 @@ def run_abliteration(args: argparse.Namespace):
             "adaptive_final_alignment": adaptive_result.final_alignment,
             "adaptive_target_ratio": adaptive_result.target_ratio,
             "adaptive_trials": adaptive_result.tried,
-        } if adaptive_result is not None else {})
+        } if adaptive_result is not None else {}),
     }
+
+    # ── SSD-Offload branch ────────────────────────────────────────────────────
+    if getattr(args, "ssd_offload", False):
+        logging.info(
+            "SSD-offload mode: computing ablated shards one-at-a-time",
+            extra={"extra_info": {"component": "cli", "event": "ssd_offload_start"}},
+        )
+        ssd_ablation_strength = (
+            adaptive_result.chosen_strength if adaptive_result is not None else args.ablation_strength
+        )
+        ablated_shards = shard_wise_ablated_parameters(
+            source_model_path=str(model_path),
+            refusal_vector=refusal_vector,
+            ablation_strength=ssd_ablation_strength,
+            ablation_method=args.ablate_method,
+        )
+        shard_wise_save_ablated_model(
+            output_dir=args.output_dir,
+            ablated_shards=ablated_shards,
+            tokenizer=tokenizer,
+            abliteration_log=abliteration_log,
+            source_model_path=str(model_path),
+        )
+        logging.info(
+            "Abliterated model saved (SSD-offload)",
+            extra={"extra_info": {"component": "cli", "event": "saving_end", "actual_output": {"output_dir": args.output_dir}}},
+        )
+        return  # done — skip the standard save_ablated_model call below
+    # ──────────────────────────────────────────────────────────────────────────
+
+    logging.info("Saving abliterated model", extra={"extra_info": {"component": "cli", "event": "saving_start"}})
+
+    log_layer_idx = use_layer_idx if args.refusal_vector_policy == "single" else "per-layer"
     # Correctly call save_ablated_model with the updated model object
     try:
         save_ablated_model(

@@ -144,7 +144,7 @@ def run_abliteration(args: argparse.Namespace):
     logging.info("Assets resolved", extra={"extra_info": {"component": "cli", "event": "asset_resolution_end"}})
 
     logging.info("Loading model and datasets", extra={"extra_info": {"component": "cli", "event": "loading_start"}})
-    model, tokenizer = mlx_lm.load(str(model_path))
+    model, tokenizer = mlx_lm.load(str(model_path), lazy=True)
 
     # ── MoE Streaming Patch ──────────────────────────────────────────────────
     # For MoE models, patch SwitchLinears to stream individual experts from mmap

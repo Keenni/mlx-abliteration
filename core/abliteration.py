@@ -171,13 +171,20 @@ class ActivationProbeWrapper(nn.Module):
 
         cache = DummyCache()
 
-        for i, layer in enumerate(self.model_layers):
-            # Create a fresh cache for each layer to avoid state leakage between layers
-            # (crucial for Mamba/Linear Attention models that store state in cache[0])
-            output = layer(h, mask=mask, cache=None)
-            h = output[0] if isinstance(output, tuple) else output
-            if layers_to_probe is not None and i in layers_to_probe:
-                captured_activations[i] = h
+        # Chunked forward to avoid GPU watchdog timeout.
+        # GPU watchdog timeout fires at ~6-10s. With per-layer ~0.4s after
+        # weights are cached, 8 layers ≈ 3.2s. Sync after each chunk to commit
+        # the command buffer and prevent graph accumulation.
+        total_layers = len(self.model_layers)
+        for chunk_start in range(0, total_layers, 8):
+            chunk_end = min(chunk_start + 8, total_layers)
+            for i in range(chunk_start, chunk_end):
+                layer = self.model_layers[i]
+                output = layer(h, mask=mask, cache=None)
+                h = output[0] if isinstance(output, tuple) else output
+                if layers_to_probe is not None and i in layers_to_probe:
+                    captured_activations[i] = h
+            mx.synchronize()  # commit command buffer, prevent watchdog timeout
 
         h = self.norm(h)
         logits = self.lm_head(h) if self.lm_head is not None else None

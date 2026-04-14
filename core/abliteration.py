@@ -188,6 +188,7 @@ class ActivationProbeWrapper(nn.Module):
 
         h = self.norm(h)
         logits = self.lm_head(h) if self.lm_head is not None else None
+
         return logits, captured_activations
 
 
@@ -1922,11 +1923,17 @@ def get_mean_activations(
             counts[layer_idx] += 1
             delta = probe_act - mean_activations[layer_idx]
             mean_activations[layer_idx] += delta / counts[layer_idx]
-        # Use async_eval to avoid GPU watchdog timeout.
-        # mx.async_eval returns immediately while the GPU executes in the background.
-        # The next iteration's mx.eval on mean_activations will wait for any
-        # pending async evaluations of those same arrays before re-evaluating.
-        mx.async_eval(list(mean_activations.values()))
+
+        # Force-evaluate the entire chain for this iteration.
+        # This makes mean_activations concrete and also traces back through
+        # all captured lazy arrays (since delta depends on captured).
+        mx.eval(list(mean_activations.values()))
+
+        # CRITICAL: Clear the captured dict to break references to lazy arrays.
+        # Without this, MLX's global graph holds references to these arrays,
+        # and subsequent wrapper calls accumulate O(n^2) complexity.
+        # We must also clear (not delete) to avoid leaving stale dict objects.
+        captured.clear()
 
     # If a probe marker was requested but never found in any example, warn once
     if marker_tokens is not None and getattr(marker_tokens, 'size', 0) > 0 and not marker_found_any:

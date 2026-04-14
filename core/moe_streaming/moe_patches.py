@@ -140,66 +140,40 @@ class QwenMoeExpertStreamer:
                         align_bytes=es,
                     )
 
-    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+    def __call__(self, x: mx.array, indices: mx.array, sorted_indices: bool = False) -> mx.array:
         """
         Patched SwitchLinear.__call__ — streams expert weights on-demand.
 
-        Original SwitchLinear does:
-            x = mx.gather_mm(x, self.weight.swapaxes(-1,-2), rhs_indices=indices)
-
-        Our version:
-            1. Load each needed expert's weight from mmap (cached in GPU)
-            2. For each expert, compute: y_i = x @ W_i.T  (single expert matmul)
-            3. Weighted-sum the expert outputs by scores
-            4. Returns the same result as original SwitchLinear but with
-               peak memory = sum of active experts' weights only
+        Simple Python loop: build a list of outputs, then mx.stack.
+        NO mx.eval() here — let the caller handle evaluation.
+        This avoids GPU command buffer timeouts from nested eval() calls.
         """
-        # Convert indices to Python list for easier handling
-        indices_list = indices.tolist() if hasattr(indices, 'tolist') else list(indices)
         num_tokens = x.shape[0]
+        out_dim = self._out_dim
 
-        # Load all needed experts from mmap (batched where possible)
+        # Convert indices to Python list once
+        idx_list = indices.tolist() if hasattr(indices, 'tolist') else None
+
+        # Build list of per-token outputs
         expert_weights = []
-        for idx in indices_list:
-            w = self.load_expert_weight(idx)
-            expert_weights.append(w)
+        for idx in range(num_tokens):
+            if idx_list is not None:
+                if isinstance(idx_list[0], (list, tuple)):
+                    expert_idx = idx_list[idx][0] if idx_list[idx] else 0
+                else:
+                    expert_idx = idx_list[idx]
+            else:
+                expert_idx = int(indices)
 
-        # Stack experts: [num_active, out_dim, in_dim]
-        W = mx.stack(expert_weights, axis=0)
+            w = self.load_expert_weight(expert_idx)  # [out_dim, in_dim]
+            w_t = w.T  # [in_dim, out_dim]
+            tok_input = mx.expand_dims(x[idx], 0)  # [1, in_dim]
+            tok_output = tok_input @ w_t  # [1, out_dim]
+            expert_weights.append(tok_output.squeeze(0))  # [out_dim] each
 
-        # mx.gather_mm semantics: given x [B, S, K] and W [E, O, I],
-        # gather selects W[indices] and computes x @ W[indices].T
-        # We replicate this: expand x to match experts dimension
-        x_expanded = mx.expand_dims(x, 1)          # [B, 1, S, K] → actually [B, S, 1, K]
-        # SwitchLinear does: x @ W.swapaxes(-1,-2)
-        # W shape: [E, O, I], x shape: [..., I]
-        # After transpose: [E, I, O], then matmul
-
-        # Equivalent to SwitchLinear's gather_mm + bias
-        x_exp = mx.expand_dims(x, -2)              # [B, S, 1, K]
-        W_t = W.swapaxes(-1, -2)                   # [E, I, O]
-        # matmul: [B, S, 1, K] @ [E, I, O] → need x to be [..., I] broadcast
-        # Actually SwitchGLU does: self.down_proj(self.activation(x_up, x_gate), idx)
-        # The activation was already applied to x_up and x_gate separately.
-
-        # We just implement SwitchLinear: x @ W_t with gather
-        # Simple approach: do per-expert matmul and gather results
-        outputs = []
-        for i, idx in enumerate(indices_list):
-            w_t = expert_weights[i].swapaxes(-1, -2)  # [in_dim, out_dim]
-            out_i = x @ w_t                             # [B, S, out_dim]
-            outputs.append(out_i)
-
-        # Stack and sum (same as original gather_mm with indices)
-        result = mx.stack(outputs, axis=0)  # [num_active, B, S, out_dim]
-        result = result.sum(axis=0)          # sum over experts
-
-        if self._sl.bias is not None:
-            # Need to add bias for each active expert
-            # This is handled by SwitchGLU's scoring mechanism
-            pass
-
-        return result
+        # Stack: [num_tokens, out_dim]
+        outputs = mx.stack(expert_weights, axis=0)
+        return outputs
 
 
 def patch_switch_linear(

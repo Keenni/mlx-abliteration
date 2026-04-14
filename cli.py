@@ -183,9 +183,8 @@ def run_abliteration(args: argparse.Namespace):
         except Exception as e:
             logging.warning(
                 f"MoE streaming patch failed: {e}. Continuing without it.",
-                extra={"extra_info": {"component": "cli", "event": "moe_streaming_failed", "error": str(e)}}},
+                extra={"extra_info": {"component": "cli", "event": "moe_streaming_failed", "error": str(e)}},
             )
-            _moe_loader = None
     # ────────────────────────────────────────────────────────────────────────
 
     # Determine the probe marker with fallback logic
@@ -284,7 +283,9 @@ def run_abliteration(args: argparse.Namespace):
 
     harmless_dataset = _load_maybe_local_json(harmless_ds_path)
     harmful_dataset = _load_maybe_local_json(harmful_ds_path)
-    num_layers = model_config["num_hidden_layers"]
+    num_layers = model_config.get("num_hidden_layers") or model_config.get("text_config", {}).get("num_hidden_layers") or model_config.get("model_config", {}).get("num_hidden_layers")
+    if num_layers is None:
+        raise KeyError(f"Could not find 'num_hidden_layers' in config.json. Available keys: {list(model_config.keys())}")
     logging.info(f"Model loaded with {num_layers} layers.", extra={"extra_info": {"component": "cli", "event": "loading_end", "actual_output": {"num_layers": num_layers}}})
 
     logging.info("Probing activations", extra={"extra_info": {"component": "cli", "event": "probing_start"}})

@@ -1809,10 +1809,12 @@ def get_mean_activations(
             - A dictionary mapping layer indices to mean activations.
             - A list of debug strings.
     """
-    hidden_size = config["hidden_size"]
+    hidden_size = config.get("hidden_size") or config.get("text_config", {}).get("hidden_size") or config.get("model_config", {}).get("hidden_size")
+    if hidden_size is None:
+        raise KeyError(f"Could not find 'hidden_size' in config. Available keys: {list(config.keys())}")
     mean_activations = {layer: mx.zeros(hidden_size) for layer in layers_to_probe}
     counts = {layer: 0 for layer in layers_to_probe}
-    max_seq_len = config.get("max_position_embeddings", 4096)
+    max_seq_len = config.get("max_position_embeddings") or config.get("text_config", {}).get("max_position_embeddings") or config.get("model_config", {}).get("max_position_embeddings") or 4096
 
     if probe_marker and probe_marker.strip():
         marker_tokens = mx.array(tokenizer.encode(probe_marker, add_special_tokens=False))

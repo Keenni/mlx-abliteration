@@ -1915,7 +1915,11 @@ def get_mean_activations(
             counts[layer_idx] += 1
             delta = probe_act - mean_activations[layer_idx]
             mean_activations[layer_idx] += delta / counts[layer_idx]
-        mx.eval(list(mean_activations.values()))
+        # Use async_eval to avoid GPU watchdog timeout.
+        # mx.async_eval returns immediately while the GPU executes in the background.
+        # The next iteration's mx.eval on mean_activations will wait for any
+        # pending async evaluations of those same arrays before re-evaluating.
+        mx.async_eval(list(mean_activations.values()))
 
     # If a probe marker was requested but never found in any example, warn once
     if marker_tokens is not None and getattr(marker_tokens, 'size', 0) > 0 and not marker_found_any:

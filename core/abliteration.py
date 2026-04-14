@@ -65,10 +65,18 @@ class ActivationProbeWrapper(nn.Module):
         
         # Attempt to find the base model or container with layers
         self.base_model = None
-        
+
         # Prefer the inner model if it has both layers and embeddings
         if hasattr(model, "model") and hasattr(model.model, "layers") and (hasattr(model.model, "embed_tokens") or hasattr(model.model, "wte")):
             self.base_model = model.model
+        # Handle Qwen3-style: model.language_model.model (TextModel -> transformer body)
+        elif (
+            hasattr(model, "language_model")
+            and hasattr(model.language_model, "model")
+            and hasattr(model.language_model.model, "layers")
+            and hasattr(model.language_model.model, "embed_tokens")
+        ):
+            self.base_model = model.language_model.model
         # Otherwise check the top level model
         elif hasattr(model, "layers") and (hasattr(model, "embed_tokens") or hasattr(model, "wte")):
             self.base_model = model
@@ -145,6 +153,7 @@ class ActivationProbeWrapper(nn.Module):
             def __init__(self):
                 # offset is used by rotary/rope implementations
                 self.offset = 0
+                self.lengths = None  # required by Qwen3.5 cache interface
                 # provide slot-keys used by gated-delta implementations
                 self._store = {0: None, 1: None}
 
@@ -165,8 +174,7 @@ class ActivationProbeWrapper(nn.Module):
         for i, layer in enumerate(self.model_layers):
             # Create a fresh cache for each layer to avoid state leakage between layers
             # (crucial for Mamba/Linear Attention models that store state in cache[0])
-            layer_cache = DummyCache()
-            output = layer(h, mask=mask, cache=layer_cache)
+            output = layer(h, mask=mask, cache=None)
             h = output[0] if isinstance(output, tuple) else output
             if layers_to_probe is not None and i in layers_to_probe:
                 captured_activations[i] = h
@@ -621,10 +629,18 @@ class ActivationProbeWrapper(nn.Module):
         
         # Attempt to find the base model or container with layers
         self.base_model = None
-        
+
         # Prefer the inner model if it has both layers and embeddings
         if hasattr(model, "model") and hasattr(model.model, "layers") and (hasattr(model.model, "embed_tokens") or hasattr(model.model, "wte")):
             self.base_model = model.model
+        # Handle Qwen3-style: model.language_model.model (TextModel -> transformer body)
+        elif (
+            hasattr(model, "language_model")
+            and hasattr(model.language_model, "model")
+            and hasattr(model.language_model.model, "layers")
+            and hasattr(model.language_model.model, "embed_tokens")
+        ):
+            self.base_model = model.language_model.model
         # Otherwise check the top level model
         elif hasattr(model, "layers") and (hasattr(model, "embed_tokens") or hasattr(model, "wte")):
             self.base_model = model
@@ -701,6 +717,7 @@ class ActivationProbeWrapper(nn.Module):
             def __init__(self):
                 # offset is used by rotary/rope implementations
                 self.offset = 0
+                self.lengths = None  # required by Qwen3.5 cache interface
                 # provide slot-keys used by gated-delta implementations
                 self._store = {0: None, 1: None}
 
@@ -721,8 +738,7 @@ class ActivationProbeWrapper(nn.Module):
         for i, layer in enumerate(self.model_layers):
             # Create a fresh cache for each layer to avoid state leakage between layers
             # (crucial for Mamba/Linear Attention models that store state in cache[0])
-            layer_cache = DummyCache()
-            output = layer(h, mask=mask, cache=layer_cache)
+            output = layer(h, mask=mask, cache=None)
             h = output[0] if isinstance(output, tuple) else output
             if layers_to_probe is not None and i in layers_to_probe:
                 captured_activations[i] = h

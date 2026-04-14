@@ -90,6 +90,7 @@ def parse_args() -> argparse.Namespace:
     output_group.add_argument("--eval-after", action="store_true", help="Run a short post-ablation generation-based refusal evaluation (diagnostic).")
     output_group.add_argument("--eval-prompts", type=str, default=None, help="Path to a JSONL file with diagnostic prompts to run during --eval-after. If omitted, a small default set is used.")
     output_group.add_argument("--ssd-offload", action="store_true", help="Enable SSD-offload mode for large models. Loads/refuses shards one-at-a-time to reduce peak RAM usage. Experimental.")
+    output_group.add_argument("--moe-streaming", action="store_true", help="Enable MoE expert streaming from SSD (via mmap). Required for activating probing on MoE models larger than available RAM. Auto-enabled with --ssd-offload for MoE models.")
     return parser.parse_args()
 
 def parse_layers(layers_str: str, num_model_layers: int) -> List[int]:
@@ -144,6 +145,48 @@ def run_abliteration(args: argparse.Namespace):
 
     logging.info("Loading model and datasets", extra={"extra_info": {"component": "cli", "event": "loading_start"}})
     model, tokenizer = mlx_lm.load(str(model_path))
+
+    # ── MoE Streaming Patch ──────────────────────────────────────────────────
+    # For MoE models, patch SwitchLinears to stream individual experts from mmap
+    # instead of loading the full fused expert weight tensor (avoids OOM).
+    _moe_loader = None
+    if getattr(args, "moe_streaming", False) or getattr(args, "ssd_offload", False):
+        try:
+            from core.moe_streaming import MoELoader
+            is_moe = False
+            try:
+                layers = model.language_model.model.layers
+                if layers:
+                    layer0_mlp = getattr(layers[0], "mlp", None)
+                    if layer0_mlp is not None:
+                        is_moe = (hasattr(layer0_mlp, "switch_mlp") or hasattr(layer0_mlp, "gate"))
+            except AttributeError:
+                is_moe = False
+
+            if is_moe:
+                logging.info(
+                    f"MoE model detected — applying expert streaming patches...",
+                    extra={"extra_info": {"component": "cli", "event": "moe_streaming_start"}},
+                )
+                _moe_loader = MoELoader(
+                    model_path=str(model_path),
+                    ram_budget_gb=16.0,
+                    max_cached_experts_per_layer=8,
+                )
+                model = _moe_loader.patch_all_moe_layers(model)
+                logging.info(
+                    "MoE expert streaming patches installed",
+                    extra={"extra_info": {"component": "cli", "event": "moe_streaming_done"}},
+                )
+            else:
+                logging.info("Not a MoE model — skipping MoE streaming patch", extra={"extra_info": {"component": "cli", "event": "moe_skip_non_moe"}})
+        except Exception as e:
+            logging.warning(
+                f"MoE streaming patch failed: {e}. Continuing without it.",
+                extra={"extra_info": {"component": "cli", "event": "moe_streaming_failed", "error": str(e)}}},
+            )
+            _moe_loader = None
+    # ────────────────────────────────────────────────────────────────────────
 
     # Determine the probe marker with fallback logic
     final_probe_marker = args.probe_marker

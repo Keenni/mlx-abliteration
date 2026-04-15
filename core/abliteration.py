@@ -743,14 +743,26 @@ class ActivationProbeWrapper(nn.Module):
 
         cache = DummyCache()
 
-        for i, layer in enumerate(self.model_layers):
-            # Create a fresh cache for each layer to avoid state leakage between layers
-            # (crucial for Mamba/Linear Attention models that store state in cache[0])
-            output = layer(h, mask=mask, cache=None)
-            h = output[0] if isinstance(output, tuple) else output
-            if layers_to_probe is not None and i in layers_to_probe:
-                captured_activations[i] = h
+        # Chunked forward to avoid GPU watchdog timeout.
+        # GPU watchdog timeout fires at ~6-10s. With per-layer ~0.4s after
+        # weights are cached, 8 layers ≈ 3.2s. Sync after each chunk.
+        total_layers = len(self.model_layers)
+        for chunk_start in range(0, total_layers, 8):
+            chunk_end = min(chunk_start + 8, total_layers)
+            for i in range(chunk_start, chunk_end):
+                layer = self.model_layers[i]
+                output = layer(h, mask=mask, cache=None)
+                h = output[0] if isinstance(output, tuple) else output
+                if layers_to_probe is not None and i in layers_to_probe:
+                    captured_activations[i] = h
+            mx.synchronize()  # commit command buffer, prevent watchdog
 
+        # CRITICAL: Evaluate captured activations to concrete to break lazy graph.
+        # Without this, mx.eval(list(captured.values())) traces back through
+        # the entire model computation graph, causing O(n^2) accumulation
+        # (248s on 2nd prompt vs 35s on 1st). By eval here, each captured
+        # array is already concrete when returned. eval per captured layer:
+        # ~0.7s × 5 probed layers = ~3.5s total (watchdog-safe with sync).
         h = self.norm(h)
         logits = self.lm_head(h) if self.lm_head is not None else None
         return logits, captured_activations
@@ -1922,17 +1934,17 @@ def get_mean_activations(
                 probe_act = act[0, use_idx, :]
             counts[layer_idx] += 1
             delta = probe_act - mean_activations[layer_idx]
-            mean_activations[layer_idx] += delta / counts[layer_idx]
+            mean_activations[layer_idx] = mean_activations[layer_idx] + delta / counts[layer_idx]
+            # CRITICAL: Immediately eval this mean to make it concrete.
+            # If we don't eval here, mean_activations[layer_idx] stays lazy and
+            # accumulates O(n) dependencies. By eval'ing immediately, subsequent
+            # delta computations start from a concrete array, breaking the chain.
+            mx.eval(mean_activations[layer_idx])
 
-        # Force-evaluate the entire chain for this iteration.
-        # This makes mean_activations concrete and also traces back through
-        # all captured lazy arrays (since delta depends on captured).
-        mx.eval(list(mean_activations.values()))
-
-        # CRITICAL: Clear the captured dict to break references to lazy arrays.
-        # Without this, MLX's global graph holds references to these arrays,
-        # and subsequent wrapper calls accumulate O(n^2) complexity.
-        # We must also clear (not delete) to avoid leaving stale dict objects.
+        # Clear the captured dict to break references to lazy arrays.
+        # Each captured[k] was traced through when we eval'd mean_activations[k]
+        # above (since delta depends on captured[k]). After that trace, captured[k]
+        # is concrete. So captured.clear() here just removes Python references.
         captured.clear()
 
     # If a probe marker was requested but never found in any example, warn once
